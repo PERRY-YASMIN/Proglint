@@ -1,8 +1,11 @@
 torch>=2.0.0
 torchvision>=0.15.0
 ultralytics>=8.3.0
-opencv-python>=4.8.0
+opencv-python-headless>=4.8.0
 numpy>=1.24.0
+lapx>=0.5.5
+filterpy>=1.4.5
+PyYAML>=6.0
 fastapi>=0.110.0
 uvicorn>=0.28.0
 python-multipart>=0.0.9
@@ -11,3 +14,4 @@ streamlit>=1.30.0
 pandas>=2.0.0
 plotly>=5.18.0
 requests>=2.28.0
+

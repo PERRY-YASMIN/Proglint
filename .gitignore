@@ -11,6 +11,24 @@ __pycache__/
 *$py.class
 *.cache
 
+# Datasets & Benchmarks
+data/pets*
+data/raw/
+data/processed/
+data/pedestrian_mini/
+data/pedestrian_mini.yaml
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Model Checkpoints & Weights
+*.pt
+*.pth
+*.onnx
+*.engine
+weights/
+
 # Execution Runs & Media Outputs
 runs/
 *.mp4
