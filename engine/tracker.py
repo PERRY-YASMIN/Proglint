@@ -54,6 +54,13 @@ class TrackInfo:
     state: TrackState = TrackState.IDLE
     state_start_time: float = 0.0
     state_start_frame: int = 0
+    # Distinct FSM states for dual-axis / both mode
+    state_y: TrackState = TrackState.IDLE
+    state_y_start_time: float = 0.0
+    state_y_start_frame: int = 0
+    state_x: TrackState = TrackState.IDLE
+    state_x_start_time: float = 0.0
+    state_x_start_frame: int = 0
     last_seen_frame: int = 0
     prev_feet_point: Optional[Tuple[float, float]] = None
     last_feet_point: Optional[Tuple[float, float]] = None
@@ -84,8 +91,10 @@ class FootfallEngine:
     """
 
     # BGR Color Constants
-    COLOR_CYAN: Tuple[int, int, int] = (255, 255, 0)       # Line A (Outer/Entrance)
-    COLOR_MAGENTA: Tuple[int, int, int] = (255, 0, 255)   # Line B (Inner/Exit)
+    COLOR_CYAN: Tuple[int, int, int] = (255, 255, 0)       # Line A / Line A_y (Horizontal Outer)
+    COLOR_MAGENTA: Tuple[int, int, int] = (255, 0, 255)   # Line B / Line B_y (Horizontal Inner)
+    COLOR_YELLOW: Tuple[int, int, int] = (0, 255, 255)    # Line A_x (Vertical Outer in Both mode)
+    COLOR_ORANGE: Tuple[int, int, int] = (0, 140, 255)    # Line B_x (Vertical Inner in Both mode)
     COLOR_GREEN: Tuple[int, int, int] = (0, 255, 0)       # Counted / Completed
     COLOR_AMBER: Tuple[int, int, int] = (0, 191, 255)     # Pending state
     COLOR_WHITE: Tuple[int, int, int] = (255, 255, 255)   # Default labels / text
@@ -235,10 +244,11 @@ class FootfallEngine:
         line_a: Optional[int] = None,
         line_b: Optional[int] = None,
         delta: Optional[float] = None,
+        axis: Optional[str] = None,
     ) -> Optional[str]:
         """Update Finite State Machine for a given track ID and return crossing type if triggered.
 
-        Supports both horizontal (Y-axis motion) and vertical (X-axis motion) tripwire gating.
+        Supports horizontal (Y-axis motion), vertical (X-axis motion), and simultaneous dual-axis gating.
         Uses velocity-aware trajectory segment crossing with a 5-pixel margin buffer:
         - Forward crossing (Down / Right): (prev < line <= curr) or (curr > prev and prev <= line + 5 and curr >= line - 5)
         - Backward crossing (Up / Left): (prev > line >= curr) or (curr < prev and prev >= line - 5 and curr <= line + 5)
@@ -260,6 +270,7 @@ class FootfallEngine:
             line_a: Generalized pixel coordinate of Line A.
             line_b: Generalized pixel coordinate of Line B.
             delta: Generalized hysteresis deadband in pixels.
+            axis: Active axis ("y", "x", or None for legacy single-axis mode).
 
         Returns:
             "IN" if an IN crossing was finalized, "OUT" if OUT was finalized, else None.
@@ -272,25 +283,77 @@ class FootfallEngine:
 
         track = self.tracks[track_id]
 
-        # Double-Count Prevention: Once COMPLETED, the track ID is permanently locked
-        if track.state == TrackState.COMPLETED:
+        # Determine active axis state
+        # In dual-axis ("both") mode, axis is "y" or "x" and modifies track.state_y or track.state_x.
+        # In single-axis mode, axis is None and modifies track.state directly.
+        if axis == "y":
+            current_state = track.state_y
+            start_time = track.state_y_start_time
+        elif axis == "x":
+            current_state = track.state_x
+            start_time = track.state_x_start_time
+        else:
+            current_state = track.state
+            start_time = track.state_start_time
+
+        def _sync_composite_state() -> None:
+            """Synchronize aggregate track.state from state_y and state_x for overlay coloring."""
+            if axis is None:
+                return
+            states = (track.state_y, track.state_x)
+            if TrackState.COUNTED_IN in states:
+                track.state = TrackState.COUNTED_IN
+            elif TrackState.COUNTED_OUT in states:
+                track.state = TrackState.COUNTED_OUT
+            elif TrackState.COMPLETED in states:
+                track.state = TrackState.COMPLETED
+            elif TrackState.PENDING_IN in states:
+                track.state = TrackState.PENDING_IN
+            elif TrackState.PENDING_OUT in states:
+                track.state = TrackState.PENDING_OUT
+            else:
+                track.state = TrackState.IDLE
+
+        def _set_active_state(new_st: TrackState, set_timer: bool = False) -> None:
+            nonlocal current_state, start_time
+            current_state = new_st
+            if axis == "y":
+                track.state_y = new_st
+                if set_timer:
+                    track.state_y_start_time = current_time
+                    track.state_y_start_frame = current_frame
+            elif axis == "x":
+                track.state_x = new_st
+                if set_timer:
+                    track.state_x_start_time = current_time
+                    track.state_x_start_frame = current_frame
+            else:
+                track.state = new_st
+                if set_timer:
+                    track.state_start_time = current_time
+                    track.state_start_frame = current_frame
+            _sync_composite_state()
+
+        # Double-Count Prevention: Once COMPLETED on this axis, it is permanently locked
+        if current_state == TrackState.COMPLETED:
             return None
 
         # If previously COUNTED in the preceding frame, transition to COMPLETED to maintain FSM sequence
-        if track.state in (TrackState.COUNTED_IN, TrackState.COUNTED_OUT):
-            track.state = TrackState.COMPLETED
+        if current_state in (TrackState.COUNTED_IN, TrackState.COUNTED_OUT):
+            _set_active_state(TrackState.COMPLETED)
             return None
 
         # Check for timeout on pending states (default 4.0s)
-        if track.state in (TrackState.PENDING_IN, TrackState.PENDING_OUT):
-            if (current_time - track.state_start_time) > timeout_sec:
+        if current_state in (TrackState.PENDING_IN, TrackState.PENDING_OUT):
+            if (current_time - start_time) > timeout_sec:
                 logger.debug(
-                    "Track %d: Pending state %s timed out (> %.2fs). Resetting to IDLE.",
+                    "Track %d (axis=%s): Pending state %s timed out (> %.2fs). Resetting to IDLE.",
                     track_id,
-                    track.state.value,
+                    axis or "default",
+                    current_state.value,
                     timeout_sec,
                 )
-                track.state = TrackState.IDLE
+                _set_active_state(TrackState.IDLE)
 
         if c_coord is None or l_a is None or l_b is None:
             return None
@@ -322,92 +385,86 @@ class FootfallEngine:
             # Forward motion (increasing coord: Top->Bottom or Left->Right) = IN (Line A -> Line B)
             # Backward motion (decreasing coord: Bottom->Top or Right->Left) = OUT (Line B -> Line A)
 
-            if track.state == TrackState.IDLE:
+            if current_state == TrackState.IDLE:
                 # Fast Mover Direct Jump: Crossed both lines in 1 frame
                 if (p_coord < first_line and c_coord >= second_line) or (_crosses_forward(first_line) and c_coord >= second_line):
-                    track.state = TrackState.COUNTED_IN
+                    _set_active_state(TrackState.COUNTED_IN)
                     crossing_event = "IN"
                 elif (p_coord > second_line and c_coord <= first_line) or (_crosses_backward(second_line) and c_coord <= first_line):
-                    track.state = TrackState.COUNTED_OUT
+                    _set_active_state(TrackState.COUNTED_OUT)
                     crossing_event = "OUT"
                 # Step 1 IN: Crossed Line A forward
                 elif _crosses_forward(first_line):
-                    track.state = TrackState.PENDING_IN
-                    track.state_start_time = current_time
-                    track.state_start_frame = current_frame
-                    logger.debug("Track %d -> PENDING_IN at frame %d", track_id, current_frame)
+                    _set_active_state(TrackState.PENDING_IN, set_timer=True)
+                    logger.debug("Track %d -> PENDING_IN (axis=%s) at frame %d", track_id, axis, current_frame)
                 # Step 1 OUT: Crossed Line B backward
                 elif _crosses_backward(second_line):
-                    track.state = TrackState.PENDING_OUT
-                    track.state_start_time = current_time
-                    track.state_start_frame = current_frame
-                    logger.debug("Track %d -> PENDING_OUT at frame %d", track_id, current_frame)
+                    _set_active_state(TrackState.PENDING_OUT, set_timer=True)
+                    logger.debug("Track %d -> PENDING_OUT (axis=%s) at frame %d", track_id, axis, current_frame)
 
-            elif track.state == TrackState.PENDING_IN:
+            elif current_state == TrackState.PENDING_IN:
                 # Step 2 IN: Subsequently crossed Line B forward within timeout_sec
                 if _crosses_forward(second_line) or (c_coord >= second_line):
-                    track.state = TrackState.COUNTED_IN
+                    _set_active_state(TrackState.COUNTED_IN)
                     crossing_event = "IN"
                 # Retreat / turnaround: Moved back behind Line A
                 elif (c_coord <= (first_line - d_val)) or (p_coord >= first_line > c_coord):
-                    track.state = TrackState.IDLE
-                    logger.debug("Track %d retreated behind Line A. State reset to IDLE.", track_id)
+                    _set_active_state(TrackState.IDLE)
+                    logger.debug("Track %d retreated behind Line A (axis=%s). State reset to IDLE.", track_id, axis)
 
-            elif track.state == TrackState.PENDING_OUT:
+            elif current_state == TrackState.PENDING_OUT:
                 # Step 2 OUT: Subsequently crossed Line A backward within timeout_sec
                 if _crosses_backward(first_line) or (c_coord <= first_line):
-                    track.state = TrackState.COUNTED_OUT
+                    _set_active_state(TrackState.COUNTED_OUT)
                     crossing_event = "OUT"
                 # Retreat / turnaround: Moved back past Line B
                 elif (c_coord >= (second_line + d_val)) or (p_coord <= second_line < c_coord):
-                    track.state = TrackState.IDLE
-                    logger.debug("Track %d retreated past Line B. State reset to IDLE.", track_id)
+                    _set_active_state(TrackState.IDLE)
+                    logger.debug("Track %d retreated past Line B (axis=%s). State reset to IDLE.", track_id, axis)
 
         else:
             # Inverted orientation: Line A is second_line (Bottom or Right), Line B is first_line (Top or Left)
             # Backward motion (decreasing coord: Bottom->Top or Right->Left) = IN (Line A -> Line B)
             # Forward motion (increasing coord: Top->Bottom or Left->Right) = OUT (Line B -> Line A)
 
-            if track.state == TrackState.IDLE:
+            if current_state == TrackState.IDLE:
                 if (p_coord > second_line and c_coord <= first_line) or (_crosses_backward(second_line) and c_coord <= first_line):
-                    track.state = TrackState.COUNTED_IN
+                    _set_active_state(TrackState.COUNTED_IN)
                     crossing_event = "IN"
                 elif (p_coord < first_line and c_coord >= second_line) or (_crosses_forward(first_line) and c_coord >= second_line):
-                    track.state = TrackState.COUNTED_OUT
+                    _set_active_state(TrackState.COUNTED_OUT)
                     crossing_event = "OUT"
                 elif _crosses_backward(second_line):
-                    track.state = TrackState.PENDING_IN
-                    track.state_start_time = current_time
-                    track.state_start_frame = current_frame
-                    logger.debug("Track %d -> PENDING_IN (inverted) at frame %d", track_id, current_frame)
+                    _set_active_state(TrackState.PENDING_IN, set_timer=True)
+                    logger.debug("Track %d -> PENDING_IN (inverted, axis=%s) at frame %d", track_id, axis, current_frame)
                 elif _crosses_forward(first_line):
-                    track.state = TrackState.PENDING_OUT
-                    track.state_start_time = current_time
-                    track.state_start_frame = current_frame
-                    logger.debug("Track %d -> PENDING_OUT (inverted) at frame %d", track_id, current_frame)
+                    _set_active_state(TrackState.PENDING_OUT, set_timer=True)
+                    logger.debug("Track %d -> PENDING_OUT (inverted, axis=%s) at frame %d", track_id, axis, current_frame)
 
-            elif track.state == TrackState.PENDING_IN:
+            elif current_state == TrackState.PENDING_IN:
                 if _crosses_backward(first_line) or (c_coord <= first_line):
-                    track.state = TrackState.COUNTED_IN
+                    _set_active_state(TrackState.COUNTED_IN)
                     crossing_event = "IN"
                 elif (c_coord >= (second_line + d_val)) or (p_coord <= second_line < c_coord):
-                    track.state = TrackState.IDLE
+                    _set_active_state(TrackState.IDLE)
 
-            elif track.state == TrackState.PENDING_OUT:
+            elif current_state == TrackState.PENDING_OUT:
                 if _crosses_forward(second_line) or (c_coord >= second_line):
-                    track.state = TrackState.COUNTED_OUT
+                    _set_active_state(TrackState.COUNTED_OUT)
                     crossing_event = "OUT"
                 elif (c_coord <= (first_line - d_val)) or (p_coord >= first_line > c_coord):
-                    track.state = TrackState.IDLE
+                    _set_active_state(TrackState.IDLE)
 
         if crossing_event == "IN":
             self.total_in += 1
-            event_record = {
+            event_record: Dict[str, Any] = {
                 "frame": int(current_frame),
                 "time_sec": float(round(current_time, 3)),
                 "id": int(track_id),
                 "type": "IN",
             }
+            if axis is not None:
+                event_record["axis"] = axis.upper()
             self.events.append(event_record)
             logger.info("Crossing Event Registered: %s (Track ID: %d)", event_record, track_id)
 
@@ -419,6 +476,8 @@ class FootfallEngine:
                 "id": int(track_id),
                 "type": "OUT",
             }
+            if axis is not None:
+                event_record["axis"] = axis.upper()
             self.events.append(event_record)
             logger.info("Crossing Event Registered: %s (Track ID: %d)", event_record, track_id)
 
@@ -434,6 +493,10 @@ class FootfallEngine:
         *,
         y_line_a: Optional[int] = None,
         y_line_b: Optional[int] = None,
+        line_a_y: Optional[int] = None,
+        line_b_y: Optional[int] = None,
+        line_a_x: Optional[int] = None,
+        line_b_x: Optional[int] = None,
     ) -> np.ndarray:
         """Render tripwires, bounding boxes, feet markers, and top-left HUD dashboard.
 
@@ -442,9 +505,13 @@ class FootfallEngine:
             line_a: Pixel coordinate for Line A (Y if horizontal, X if vertical).
             line_b: Pixel coordinate for Line B (Y if horizontal, X if vertical).
             current_frame_tracks: List of TrackInfo instances detected in the current frame.
-            orientation: "horizontal" or "vertical".
+            orientation: "horizontal", "vertical", or "both".
             y_line_a: Backward compatibility alias for line_a.
             y_line_b: Backward compatibility alias for line_b.
+            line_a_y: Pixel coordinate for Horizontal Line A_y (in both mode).
+            line_b_y: Pixel coordinate for Horizontal Line B_y (in both mode).
+            line_a_x: Pixel coordinate for Vertical Line A_x (in both mode).
+            line_b_x: Pixel coordinate for Vertical Line B_x (in both mode).
 
         Returns:
             Annotated frame image.
@@ -457,7 +524,71 @@ class FootfallEngine:
         l_b = line_b if line_b is not None else (y_line_b if y_line_b is not None else int(height * 0.55))
 
         clean_orientation = orientation.lower().strip() if orientation else "horizontal"
-        if clean_orientation == "vertical":
+        if clean_orientation == "both":
+            # 1. Draw Dual-Axis Virtual Tripwires:
+            # Horizontal gate (Line A_y: Cyan, Line B_y: Magenta)
+            lay = line_a_y if line_a_y is not None else l_a
+            lby = line_b_y if line_b_y is not None else l_b
+            y_a = int(max(0, min(height - 1, round(float(lay)))))
+            cv2.line(annotated, (0, y_a), (int(width - 1), y_a), self.COLOR_CYAN, 2, cv2.LINE_AA)
+            label_y_a = int(max(20, min(height - 5, y_a - 8)))
+            cv2.putText(
+                annotated,
+                "Line A_y (Horizontal Outer)",
+                (15, label_y_a),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                self.COLOR_CYAN,
+                2,
+                cv2.LINE_AA,
+            )
+
+            y_b = int(max(0, min(height - 1, round(float(lby)))))
+            cv2.line(annotated, (0, y_b), (int(width - 1), y_b), self.COLOR_MAGENTA, 2, cv2.LINE_AA)
+            label_y_b = int(max(20, min(height - 5, y_b - 8)))
+            cv2.putText(
+                annotated,
+                "Line B_y (Horizontal Inner)",
+                (15, label_y_b),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                self.COLOR_MAGENTA,
+                2,
+                cv2.LINE_AA,
+            )
+
+            # Vertical gate (Line A_x: Yellow, Line B_x: Orange)
+            lax = line_a_x if line_a_x is not None else int(width * 0.40)
+            lbx = line_b_x if line_b_x is not None else int(width * 0.60)
+            x_a = int(max(0, min(width - 1, round(float(lax)))))
+            cv2.line(annotated, (x_a, 0), (x_a, int(height - 1)), self.COLOR_YELLOW, 2, cv2.LINE_AA)
+            label_x_a = int(max(10, min(width - 240, x_a + 8)))
+            cv2.putText(
+                annotated,
+                "Line A_x (Vertical Outer)",
+                (label_x_a, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                self.COLOR_YELLOW,
+                2,
+                cv2.LINE_AA,
+            )
+
+            x_b = int(max(0, min(width - 1, round(float(lbx)))))
+            cv2.line(annotated, (x_b, 0), (x_b, int(height - 1)), self.COLOR_ORANGE, 2, cv2.LINE_AA)
+            label_x_b = int(max(10, min(width - 240, x_b + 8)))
+            cv2.putText(
+                annotated,
+                "Line B_x (Vertical Inner)",
+                (label_x_b, 65),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                self.COLOR_ORANGE,
+                2,
+                cv2.LINE_AA,
+            )
+
+        elif clean_orientation == "vertical":
             # 1. Draw Dual Virtual Tripwires vertically across full frame height
             # Line A - Cyan (BGR: 255, 255, 0)
             x_a = int(max(0, min(width - 1, round(float(l_a)))))
@@ -662,6 +793,10 @@ class FootfallEngine:
         timestamp: Optional[float] = None,
         skip_detection: bool = False,
         orientation: str = "horizontal",
+        line_a_y_norm: Optional[float] = None,
+        line_b_y_norm: Optional[float] = None,
+        line_a_x_norm: Optional[float] = None,
+        line_b_x_norm: Optional[float] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Process a single video frame for person detection, tracking, and counting.
 
@@ -674,7 +809,11 @@ class FootfallEngine:
             frame_idx: Optional frame index (auto-increments if None).
             timestamp: Optional timestamp in seconds (uses current time / FPS if None).
             skip_detection: When True, skips YOLO11 forward pass and reuses verified tracks without velocity drift.
-            orientation: "horizontal" (Top/Bottom flow) or "vertical" (Left/Right flow).
+            orientation: "horizontal" (Top/Bottom flow), "vertical" (Left/Right flow), or "both" (Dual-Axis flow).
+            line_a_y_norm: Optional normalized coordinate for horizontal Line A_y (in both mode).
+            line_b_y_norm: Optional normalized coordinate for horizontal Line B_y (in both mode).
+            line_a_x_norm: Optional normalized coordinate for vertical Line A_x (in both mode).
+            line_b_x_norm: Optional normalized coordinate for vertical Line B_x (in both mode).
 
         Returns:
             Tuple of (annotated_frame, frame_summary_dict).
@@ -692,16 +831,37 @@ class FootfallEngine:
         current_time = float(timestamp) if timestamp is not None else time.time()
 
         clean_orientation = orientation.lower().strip() if orientation else "horizontal"
-        if clean_orientation != "vertical":
+        if clean_orientation not in ("horizontal", "vertical", "both"):
             clean_orientation = "horizontal"
 
         height, width = frame.shape[:2]
-        if clean_orientation == "vertical":
+        if clean_orientation == "both":
+            lay_norm = line_a_y_norm if line_a_y_norm is not None else line_a_norm
+            lby_norm = line_b_y_norm if line_b_y_norm is not None else line_b_norm
+            lax_norm = line_a_x_norm if line_a_x_norm is not None else line_a_norm
+            lbx_norm = line_b_x_norm if line_b_x_norm is not None else line_b_norm
+
+            line_a_y_pixel = int(round(float(lay_norm * height)))
+            line_b_y_pixel = int(round(float(lby_norm * height)))
+            line_a_x_pixel = int(round(float(lax_norm * width)))
+            line_b_x_pixel = int(round(float(lbx_norm * width)))
+
+            line_a_pixel = line_a_y_pixel
+            line_b_pixel = line_b_y_pixel
+        elif clean_orientation == "vertical":
             line_a_pixel = int(round(float(line_a_norm * width)))
             line_b_pixel = int(round(float(line_b_norm * width)))
+            line_a_y_pixel = None
+            line_b_y_pixel = None
+            line_a_x_pixel = line_a_pixel
+            line_b_x_pixel = line_b_pixel
         else:
             line_a_pixel = int(round(float(line_a_norm * height)))
             line_b_pixel = int(round(float(line_b_norm * height)))
+            line_a_y_pixel = line_a_pixel
+            line_b_y_pixel = line_b_pixel
+            line_a_x_pixel = None
+            line_b_x_pixel = None
 
         current_frame_tracks: List[TrackInfo] = []
         new_events: List[Dict[str, Any]] = []
@@ -752,7 +912,6 @@ class FootfallEngine:
                         x_center = float((x1 + x2) / 2.0)
                         y_feet = float(y2)
                         curr_point = (x_center, y_feet)
-                        curr_coord = x_center if clean_orientation == "vertical" else y_feet
 
                         # Cache current detection and active track bounding box
                         self.cached_detections.append({
@@ -776,17 +935,16 @@ class FootfallEngine:
                             )
                             track_info.trajectory.append(curr_point)
                             self.tracks[track_id] = track_info
-                            prev_coord = None
+                            prev_x = None
+                            prev_y = None
                         else:
                             track_info = self.tracks[track_id]
                             if track_info.last_feet_point is not None:
-                                prev_coord = (
-                                    track_info.last_feet_point[0]
-                                    if clean_orientation == "vertical"
-                                    else track_info.last_feet_point[1]
-                                )
+                                prev_x = track_info.last_feet_point[0]
+                                prev_y = track_info.last_feet_point[1]
                             else:
-                                prev_coord = None
+                                prev_x = None
+                                prev_y = None
 
                             track_info.prev_feet_point = track_info.last_feet_point
                             track_info.last_feet_point = curr_point
@@ -796,20 +954,74 @@ class FootfallEngine:
                             track_info.trajectory.append(curr_point)
 
                         # Update FSM Crossing Logic
-                        event_type = self._update_fsm(
-                            track_id=track_id,
-                            prev_coord=prev_coord,
-                            curr_coord=curr_coord,
-                            line_a=line_a_pixel,
-                            line_b=line_b_pixel,
-                            delta=delta_y,
-                            timeout_sec=timeout_sec,
-                            current_time=current_time,
-                            current_frame=current_frame,
-                            orientation=clean_orientation,
-                        )
-                        if event_type is not None:
-                            new_events.append(self.events[-1])
+                        if clean_orientation == "both":
+                            # 1. Evaluate Horizontal / Y-axis gate
+                            ev_y = self._update_fsm(
+                                track_id=track_id,
+                                prev_coord=prev_y,
+                                curr_coord=y_feet,
+                                line_a=line_a_y_pixel,
+                                line_b=line_b_y_pixel,
+                                delta=delta_y,
+                                timeout_sec=timeout_sec,
+                                current_time=current_time,
+                                current_frame=current_frame,
+                                orientation="horizontal",
+                                axis="y",
+                            )
+                            if ev_y is not None:
+                                new_events.append(self.events[-1])
+
+                            # 2. Evaluate Vertical / X-axis gate
+                            ev_x = self._update_fsm(
+                                track_id=track_id,
+                                prev_coord=prev_x,
+                                curr_coord=x_center,
+                                line_a=line_a_x_pixel,
+                                line_b=line_b_x_pixel,
+                                delta=delta_y,
+                                timeout_sec=timeout_sec,
+                                current_time=current_time,
+                                current_frame=current_frame,
+                                orientation="vertical",
+                                axis="x",
+                            )
+                            if ev_x is not None:
+                                new_events.append(self.events[-1])
+
+                        elif clean_orientation == "vertical":
+                            event_type = self._update_fsm(
+                                track_id=track_id,
+                                prev_coord=prev_x,
+                                curr_coord=x_center,
+                                line_a=line_a_pixel,
+                                line_b=line_b_pixel,
+                                delta=delta_y,
+                                timeout_sec=timeout_sec,
+                                current_time=current_time,
+                                current_frame=current_frame,
+                                orientation="vertical",
+                                axis=None,
+                            )
+                            if event_type is not None:
+                                new_events.append(self.events[-1])
+
+                        else:
+                            event_type = self._update_fsm(
+                                track_id=track_id,
+                                prev_coord=prev_y,
+                                curr_coord=y_feet,
+                                line_a=line_a_pixel,
+                                line_b=line_b_pixel,
+                                delta=delta_y,
+                                timeout_sec=timeout_sec,
+                                current_time=current_time,
+                                current_frame=current_frame,
+                                orientation="horizontal",
+                                axis=None,
+                            )
+                            if event_type is not None:
+                                new_events.append(self.events[-1])
 
                         current_frame_tracks.append(track_info)
 
@@ -831,36 +1043,79 @@ class FootfallEngine:
                 if track_info.last_feet_point is None:
                     continue
 
-                curr_coord = (
-                    track_info.last_feet_point[0]
-                    if clean_orientation == "vertical"
-                    else track_info.last_feet_point[1]
-                )
-                if track_info.prev_feet_point:
-                    prev_coord = (
-                        track_info.prev_feet_point[0]
-                        if clean_orientation == "vertical"
-                        else track_info.prev_feet_point[1]
-                    )
-                else:
-                    prev_coord = curr_coord
+                curr_x = track_info.last_feet_point[0]
+                curr_y = track_info.last_feet_point[1]
+                prev_x = track_info.prev_feet_point[0] if track_info.prev_feet_point else curr_x
+                prev_y = track_info.prev_feet_point[1] if track_info.prev_feet_point else curr_y
 
                 track_info.last_seen_frame = current_frame
 
-                event_type = self._update_fsm(
-                    track_id=track_id,
-                    prev_coord=prev_coord,
-                    curr_coord=curr_coord,
-                    line_a=line_a_pixel,
-                    line_b=line_b_pixel,
-                    delta=delta_y,
-                    timeout_sec=timeout_sec,
-                    current_time=current_time,
-                    current_frame=current_frame,
-                    orientation=clean_orientation,
-                )
-                if event_type is not None:
-                    new_events.append(self.events[-1])
+                if clean_orientation == "both":
+                    ev_y = self._update_fsm(
+                        track_id=track_id,
+                        prev_coord=prev_y,
+                        curr_coord=curr_y,
+                        line_a=line_a_y_pixel,
+                        line_b=line_b_y_pixel,
+                        delta=delta_y,
+                        timeout_sec=timeout_sec,
+                        current_time=current_time,
+                        current_frame=current_frame,
+                        orientation="horizontal",
+                        axis="y",
+                    )
+                    if ev_y is not None:
+                        new_events.append(self.events[-1])
+
+                    ev_x = self._update_fsm(
+                        track_id=track_id,
+                        prev_coord=prev_x,
+                        curr_coord=curr_x,
+                        line_a=line_a_x_pixel,
+                        line_b=line_b_x_pixel,
+                        delta=delta_y,
+                        timeout_sec=timeout_sec,
+                        current_time=current_time,
+                        current_frame=current_frame,
+                        orientation="vertical",
+                        axis="x",
+                    )
+                    if ev_x is not None:
+                        new_events.append(self.events[-1])
+
+                elif clean_orientation == "vertical":
+                    event_type = self._update_fsm(
+                        track_id=track_id,
+                        prev_coord=prev_x,
+                        curr_coord=curr_x,
+                        line_a=line_a_pixel,
+                        line_b=line_b_pixel,
+                        delta=delta_y,
+                        timeout_sec=timeout_sec,
+                        current_time=current_time,
+                        current_frame=current_frame,
+                        orientation="vertical",
+                        axis=None,
+                    )
+                    if event_type is not None:
+                        new_events.append(self.events[-1])
+
+                else:
+                    event_type = self._update_fsm(
+                        track_id=track_id,
+                        prev_coord=prev_y,
+                        curr_coord=curr_y,
+                        line_a=line_a_pixel,
+                        line_b=line_b_pixel,
+                        delta=delta_y,
+                        timeout_sec=timeout_sec,
+                        current_time=current_time,
+                        current_frame=current_frame,
+                        orientation="horizontal",
+                        axis=None,
+                    )
+                    if event_type is not None:
+                        new_events.append(self.events[-1])
 
                 current_frame_tracks.append(track_info)
 
@@ -875,6 +1130,10 @@ class FootfallEngine:
                 line_b=line_b_pixel,
                 current_frame_tracks=current_frame_tracks,
                 orientation=clean_orientation,
+                line_a_y=line_a_y_pixel,
+                line_b_y=line_b_y_pixel,
+                line_a_x=line_a_x_pixel,
+                line_b_x=line_b_x_pixel,
             )
         except Exception as exc:
             logger.warning(
@@ -909,6 +1168,10 @@ class FootfallEngine:
         frame_stride: int = 1,
         progress_callback: Optional[Callable[[int, int, float], None]] = None,
         orientation: str = "horizontal",
+        line_a_y_norm: Optional[float] = None,
+        line_b_y_norm: Optional[float] = None,
+        line_a_x_norm: Optional[float] = None,
+        line_b_x_norm: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Process an entire video file, writing annotated output if desired and returning metrics.
 
@@ -921,7 +1184,11 @@ class FootfallEngine:
             delta_y: Hysteresis deadband margin in pixels.
             frame_stride: Inference stride (defaults to 1 for full per-frame processing).
             progress_callback: Optional callback func(current_frame, total_frames, current_fps).
-            orientation: "horizontal" (Top/Bottom flow) or "vertical" (Left/Right flow).
+            orientation: "horizontal" (Top/Bottom flow), "vertical" (Left/Right flow), or "both" (Dual-Axis flow).
+            line_a_y_norm: Optional normalized coordinate for horizontal Line A_y (in both mode).
+            line_b_y_norm: Optional normalized coordinate for horizontal Line B_y (in both mode).
+            line_a_x_norm: Optional normalized coordinate for vertical Line A_x (in both mode).
+            line_b_x_norm: Optional normalized coordinate for vertical Line B_x (in both mode).
 
         Returns:
             Dictionary containing:
@@ -930,7 +1197,7 @@ class FootfallEngine:
                 "total_out": int,
                 "occupancy": int,
                 "total_tracks": int,
-                "events": [{"frame": int, "time_sec": float, "id": int, "type": "IN"|"OUT"}],
+                "events": [{"frame": int, "time_sec": float, "id": int, "type": "IN"|"OUT", "axis": "Y"|"X"}],
                 "avg_fps": float,
                 "total_frames": int,
                 "orientation": str
@@ -943,7 +1210,7 @@ class FootfallEngine:
         self.reset()
 
         clean_orientation = orientation.lower().strip() if orientation else "horizontal"
-        if clean_orientation != "vertical":
+        if clean_orientation not in ("horizontal", "vertical", "both"):
             clean_orientation = "horizontal"
 
         cap: Optional[cv2.VideoCapture] = None
@@ -1043,6 +1310,10 @@ class FootfallEngine:
                         timestamp=frame_time_sec,
                         skip_detection=should_skip,
                         orientation=clean_orientation,
+                        line_a_y_norm=line_a_y_norm,
+                        line_b_y_norm=line_b_y_norm,
+                        line_a_x_norm=line_a_x_norm,
+                        line_b_x_norm=line_b_x_norm,
                     )
                 except Exception as frame_exc:
                     logger.warning(

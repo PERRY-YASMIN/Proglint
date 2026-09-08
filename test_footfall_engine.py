@@ -834,6 +834,116 @@ class TestFootfallEngine(unittest.TestCase):
         # Check magenta color on vertical Line B at x=400, y=240
         self.assertTrue(np.array_equal(annotated[240, 400], self.engine.COLOR_MAGENTA))
 
+    def test_both_overlay_rendering(self):
+        """Verify _draw_overlays renders both horizontal (Cyan/Magenta) and vertical (Yellow/Orange) gates."""
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        annotated = self.engine._draw_overlays(
+            frame=frame,
+            line_a_y=100,
+            line_b_y=200,
+            line_a_x=150,
+            line_b_x=300,
+            current_frame_tracks=[],
+            orientation="both",
+        )
+        self.assertEqual(annotated.shape, frame.shape)
+        # Check Cyan color on horizontal Line A_y at y=100, x=320
+        self.assertTrue(np.array_equal(annotated[100, 320], self.engine.COLOR_CYAN))
+        # Check Magenta color on horizontal Line B_y at y=200, x=320
+        self.assertTrue(np.array_equal(annotated[200, 320], self.engine.COLOR_MAGENTA))
+        # Check Yellow color on vertical Line A_x at x=150, y=240
+        self.assertTrue(np.array_equal(annotated[240, 150], self.engine.COLOR_YELLOW))
+        # Check Orange color on vertical Line B_x at x=300, y=240
+        self.assertTrue(np.array_equal(annotated[240, 300], self.engine.COLOR_ORANGE))
+
+    def test_fsm_both_mode_simultaneous_x_and_y_crossings(self):
+        """Test pedestrian track undergoing independent crossings on both Y and X axes."""
+        track_id = 901
+        self.engine.tracks[track_id] = TrackInfo(
+            track_id=track_id,
+            state=TrackState.IDLE,
+            state_y=TrackState.IDLE,
+            state_x=TrackState.IDLE,
+            last_seen_frame=1,
+            prev_feet_point=(150.0, 350.0),
+            last_feet_point=(150.0, 350.0),
+        )
+        self.engine.seen_track_ids.add(track_id)
+
+        # 1. Y-axis Step 1: cross horizontal Line A_y (350 -> 420 >= 400)
+        ev_y1 = self.engine._update_fsm(
+            track_id=track_id,
+            prev_coord=350.0,
+            curr_coord=420.0,
+            line_a=400,
+            line_b=600,
+            delta=10.0,
+            timeout_sec=4.0,
+            current_time=1.0,
+            current_frame=2,
+            orientation="horizontal",
+            axis="y",
+        )
+        self.assertIsNone(ev_y1)
+        self.assertEqual(self.engine.tracks[track_id].state_y, TrackState.PENDING_IN)
+        self.assertEqual(self.engine.tracks[track_id].state, TrackState.PENDING_IN)
+
+        # 2. X-axis Step 1: cross vertical Line A_x (150 -> 220 >= 200)
+        ev_x1 = self.engine._update_fsm(
+            track_id=track_id,
+            prev_coord=150.0,
+            curr_coord=220.0,
+            line_a=200,
+            line_b=400,
+            delta=10.0,
+            timeout_sec=4.0,
+            current_time=1.0,
+            current_frame=2,
+            orientation="vertical",
+            axis="x",
+        )
+        self.assertIsNone(ev_x1)
+        self.assertEqual(self.engine.tracks[track_id].state_x, TrackState.PENDING_IN)
+
+        # 3. Y-axis Step 2: cross horizontal Line B_y (420 -> 620 >= 600)
+        ev_y2 = self.engine._update_fsm(
+            track_id=track_id,
+            prev_coord=420.0,
+            curr_coord=620.0,
+            line_a=400,
+            line_b=600,
+            delta=10.0,
+            timeout_sec=4.0,
+            current_time=1.5,
+            current_frame=3,
+            orientation="horizontal",
+            axis="y",
+        )
+        self.assertEqual(ev_y2, "IN")
+        self.assertEqual(self.engine.tracks[track_id].state_y, TrackState.COUNTED_IN)
+        self.assertEqual(self.engine.total_in, 1)
+        self.assertEqual(self.engine.events[-1]["axis"], "Y")
+
+        # 4. X-axis Step 2: cross vertical Line B_x (220 -> 420 >= 400)
+        ev_x2 = self.engine._update_fsm(
+            track_id=track_id,
+            prev_coord=220.0,
+            curr_coord=420.0,
+            line_a=200,
+            line_b=400,
+            delta=10.0,
+            timeout_sec=4.0,
+            current_time=1.8,
+            current_frame=4,
+            orientation="vertical",
+            axis="x",
+        )
+        self.assertEqual(ev_x2, "IN")
+        self.assertEqual(self.engine.tracks[track_id].state_x, TrackState.COUNTED_IN)
+        self.assertEqual(self.engine.total_in, 2)
+        self.assertEqual(self.engine.occupancy, 2)
+        self.assertEqual(self.engine.events[-1]["axis"], "X")
+
     def test_process_video_vertical(self):
         """Verify process_video with orientation='vertical' runs end-to-end and returns orientation."""
         temp_dir = tempfile.mkdtemp()
@@ -857,6 +967,37 @@ class TestFootfallEngine(unittest.TestCase):
             )
             self.assertEqual(metrics["total_frames"], 5)
             self.assertEqual(metrics["orientation"], "vertical")
+            self.assertTrue(os.path.exists(out_path))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_process_video_both_mode(self):
+        """Verify process_video with orientation='both' processes dual-axis coordinates end-to-end."""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            in_path = os.path.join(temp_dir, "both_test.mp4")
+            out_path = os.path.join(temp_dir, "both_out.mp4")
+
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(in_path, fourcc, 30.0, (320, 240))
+            for i in range(5):
+                writer.write(np.full((240, 320, 3), 70 + i, dtype=np.uint8))
+            writer.release()
+
+            metrics = self.engine.process_video(
+                input_path=in_path,
+                output_raw_path=out_path,
+                line_a_norm=0.45,
+                line_b_norm=0.55,
+                line_a_y_norm=0.40,
+                line_b_y_norm=0.60,
+                line_a_x_norm=0.35,
+                line_b_x_norm=0.65,
+                frame_stride=1,
+                orientation="both",
+            )
+            self.assertEqual(metrics["total_frames"], 5)
+            self.assertEqual(metrics["orientation"], "both")
             self.assertTrue(os.path.exists(out_path))
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)

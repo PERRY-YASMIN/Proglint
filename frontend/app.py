@@ -61,6 +61,14 @@ st.markdown(
         color: #FF00FF;
         font-weight: 600;
     }
+    .legend-yellow {
+        color: #FFFF00;
+        font-weight: 600;
+    }
+    .legend-orange {
+        color: #FFA500;
+        font-weight: 600;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -110,16 +118,84 @@ def extract_first_frame(video_bytes: bytes, file_ext: str) -> Optional[np.ndarra
 
 def draw_calibration_lines(
     frame: np.ndarray,
-    line_a_norm: float,
-    line_b_norm: float,
+    line_a_norm: float = 0.45,
+    line_b_norm: float = 0.55,
     orientation: str = "horizontal",
+    *,
+    line_a_y_norm: Optional[float] = None,
+    line_b_y_norm: Optional[float] = None,
+    line_a_x_norm: Optional[float] = None,
+    line_b_x_norm: Optional[float] = None,
 ) -> np.ndarray:
     """Draw virtual tripwires on frame copy for calibration preview."""
     annotated = frame.copy()
     h, w = annotated.shape[:2]
 
     clean_orientation = orientation.lower().strip() if orientation else "horizontal"
-    if clean_orientation == "vertical":
+    if clean_orientation == "both":
+        lay = line_a_y_norm if line_a_y_norm is not None else line_a_norm
+        lby = line_b_y_norm if line_b_y_norm is not None else line_b_norm
+        lax = line_a_x_norm if line_a_x_norm is not None else line_a_norm
+        lbx = line_b_x_norm if line_b_x_norm is not None else line_b_norm
+
+        y_a = int(lay * h)
+        y_b = int(lby * h)
+        x_a = int(lax * w)
+        x_b = int(lbx * w)
+
+        # Horizontal Gate: Line A_y (Cyan) and Line B_y (Magenta)
+        cv2.line(annotated, (0, y_a), (w, y_a), (255, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(
+            annotated,
+            f"Line A_y (Horizontal Outer): {lay:.2f}",
+            (15, max(24, y_a - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.line(annotated, (0, y_b), (w, y_b), (255, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(
+            annotated,
+            f"Line B_y (Horizontal Inner): {lby:.2f}",
+            (15, max(24, y_b - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        # Vertical Gate: Line A_x (Yellow: BGR 0, 255, 255) and Line B_x (Orange: BGR 0, 140, 255)
+        cv2.line(annotated, (x_a, 0), (x_a, h), (0, 255, 255), 2, cv2.LINE_AA)
+        label_x_a = int(max(10, min(w - 240, x_a + 8)))
+        cv2.putText(
+            annotated,
+            f"Line A_x (Vertical Outer): {lax:.2f}",
+            (label_x_a, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.line(annotated, (x_b, 0), (x_b, h), (0, 140, 255), 2, cv2.LINE_AA)
+        label_x_b = int(max(10, min(w - 240, x_b + 8)))
+        cv2.putText(
+            annotated,
+            f"Line B_x (Vertical Inner): {lbx:.2f}",
+            (label_x_b, 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 140, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    elif clean_orientation == "vertical":
         x_a = int(line_a_norm * w)
         x_b = int(line_b_norm * w)
 
@@ -290,32 +366,78 @@ st.sidebar.subheader("📐 Tripwire Plane Calibration")
 
 orientation_choice = st.sidebar.radio(
     "Gate Orientation",
-    ["Horizontal (Top/Bottom Flow)", "Vertical (Left/Right Flow)"],
+    ["Horizontal (Top/Bottom Flow)", "Vertical (Left/Right Flow)", "Both (Dual-Axis Flow)"],
     help="Select tripwire orientation based on pedestrian walking direction in the video.",
 )
-orientation_val = "vertical" if "Vertical" in orientation_choice else "horizontal"
+if "Both" in orientation_choice:
+    orientation_val = "both"
+elif "Vertical" in orientation_choice:
+    orientation_val = "vertical"
+else:
+    orientation_val = "horizontal"
 
-axis_name = "horizontal" if orientation_val == "vertical" else "vertical"
-pos_a_desc = "0.0=Left, 1.0=Right" if orientation_val == "vertical" else "0.0=Top, 1.0=Bottom"
-pos_b_desc = "0.0=Left, 1.0=Right" if orientation_val == "vertical" else "0.0=Top, 1.0=Bottom"
+if orientation_val == "both":
+    st.sidebar.markdown("**Horizontal Gate (Top/Bottom Flow)**")
+    line_a_y_norm = st.sidebar.slider(
+        "Line A_y (Horizontal Outer - Cyan)",
+        min_value=0.05,
+        max_value=0.95,
+        value=0.45,
+        step=0.01,
+        help="Normalized Y position (0.0=Top, 1.0=Bottom). Pedestrians cross Line A_y first when entering vertically.",
+    )
+    line_b_y_norm = st.sidebar.slider(
+        "Line B_y (Horizontal Inner - Magenta)",
+        min_value=0.05,
+        max_value=0.95,
+        value=0.55,
+        step=0.01,
+        help="Normalized Y position (0.0=Top, 1.0=Bottom). Pedestrians cross Line B_y to complete vertical entry.",
+    )
+    st.sidebar.markdown("**Vertical Gate (Left/Right Flow)**")
+    line_a_x_norm = st.sidebar.slider(
+        "Line A_x (Vertical Outer - Yellow)",
+        min_value=0.05,
+        max_value=0.95,
+        value=0.40,
+        step=0.01,
+        help="Normalized X position (0.0=Left, 1.0=Right). Pedestrians cross Line A_x first when entering horizontally.",
+    )
+    line_b_x_norm = st.sidebar.slider(
+        "Line B_x (Vertical Inner - Orange)",
+        min_value=0.05,
+        max_value=0.95,
+        value=0.60,
+        step=0.01,
+        help="Normalized X position (0.0=Left, 1.0=Right). Pedestrians cross Line B_x to complete horizontal entry.",
+    )
+    line_a_norm = line_a_y_norm
+    line_b_norm = line_b_y_norm
+else:
+    axis_name = "horizontal" if orientation_val == "vertical" else "vertical"
+    pos_a_desc = "0.0=Left, 1.0=Right" if orientation_val == "vertical" else "0.0=Top, 1.0=Bottom"
+    pos_b_desc = "0.0=Left, 1.0=Right" if orientation_val == "vertical" else "0.0=Top, 1.0=Bottom"
 
-line_a_norm = st.sidebar.slider(
-    "Line A (Outer - Cyan)",
-    min_value=0.05,
-    max_value=0.95,
-    value=0.45,
-    step=0.01,
-    help=f"Normalized {axis_name} position ({pos_a_desc}). Pedestrians cross Line A first when entering.",
-)
-
-line_b_norm = st.sidebar.slider(
-    "Line B (Inner - Magenta)",
-    min_value=0.05,
-    max_value=0.95,
-    value=0.55,
-    step=0.01,
-    help=f"Normalized {axis_name} position ({pos_b_desc}). Pedestrians cross Line B to complete entry.",
-)
+    line_a_norm = st.sidebar.slider(
+        "Line A (Outer - Cyan)",
+        min_value=0.05,
+        max_value=0.95,
+        value=0.45,
+        step=0.01,
+        help=f"Normalized {axis_name} position ({pos_a_desc}). Pedestrians cross Line A first when entering.",
+    )
+    line_b_norm = st.sidebar.slider(
+        "Line B (Inner - Magenta)",
+        min_value=0.05,
+        max_value=0.95,
+        value=0.55,
+        step=0.01,
+        help=f"Normalized {axis_name} position ({pos_b_desc}). Pedestrians cross Line B to complete entry.",
+    )
+    line_a_y_norm = None
+    line_b_y_norm = None
+    line_a_x_norm = None
+    line_b_x_norm = None
 
 timeout_sec = st.sidebar.slider(
     "FSM Crossing Timeout (s)",
@@ -362,20 +484,38 @@ if uploaded_file is not None:
         st.subheader("🎯 Dual Tripwire Calibration Preview")
         if first_frame is not None:
             preview_drawn = draw_calibration_lines(
-                first_frame, line_a_norm, line_b_norm, orientation=orientation_val
+                first_frame,
+                line_a_norm=line_a_norm,
+                line_b_norm=line_b_norm,
+                orientation=orientation_val,
+                line_a_y_norm=line_a_y_norm,
+                line_b_y_norm=line_b_y_norm,
+                line_a_x_norm=line_a_x_norm,
+                line_b_x_norm=line_b_x_norm,
             )
             st.image(
                 preview_drawn,
                 caption=f"Tripwire Overlay Preview ({first_frame.shape[1]}x{first_frame.shape[0]}px - {orientation_val.capitalize()})",
                 width="stretch",
             )
-            st.markdown(
-                '<div class="tripwire-legend">'
-                '<span class="legend-a">━ Line A: Outer Boundary</span>'
-                '<span class="legend-b">━ Line B: Inner Boundary</span>'
-                '</div>',
-                unsafe_allow_html=True,
-            )
+            if orientation_val == "both":
+                st.markdown(
+                    '<div class="tripwire-legend">'
+                    '<span class="legend-a">━ Line A_y (Horizontal Outer)</span>'
+                    '<span class="legend-b">━ Line B_y (Horizontal Inner)</span>'
+                    '<span class="legend-yellow">━ Line A_x (Vertical Outer)</span>'
+                    '<span class="legend-orange">━ Line B_x (Vertical Inner)</span>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="tripwire-legend">'
+                    '<span class="legend-a">━ Line A: Outer Boundary</span>'
+                    '<span class="legend-b">━ Line B: Inner Boundary</span>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
         else:
             st.warning("Unable to render first frame preview. Video format may require transcoding.")
 
@@ -408,6 +548,11 @@ if uploaded_file is not None:
                         "frame_stride": str(frame_stride),
                         "orientation": orientation_val,
                     }
+                    if orientation_val == "both":
+                        data["line_a_y_norm"] = str(line_a_y_norm)
+                        data["line_b_y_norm"] = str(line_b_y_norm)
+                        data["line_a_x_norm"] = str(line_a_x_norm)
+                        data["line_b_x_norm"] = str(line_b_x_norm)
 
                     response = requests.post(process_url, files=files, data=data, timeout=None)
 
@@ -435,16 +580,15 @@ if "result_payload" in st.session_state:
     # 4 Metric Cards
     kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
 
-    delta_in = (
-        "Line A → Line B (Left → Right)"
-        if orientation_val == "vertical"
-        else "Line A → Line B (Top → Bottom)"
-    )
-    delta_out = (
-        "- Line B → Line A (Right → Left)"
-        if orientation_val == "vertical"
-        else "- Line B → Line A (Bottom → Top)"
-    )
+    if orientation_val == "both":
+        delta_in = "Dual-Axis Omni-Flow (X & Y)"
+        delta_out = "Dual-Axis Omni-Flow (X & Y)"
+    elif orientation_val == "vertical":
+        delta_in = "Line A → Line B (Left → Right)"
+        delta_out = "- Line B → Line A (Right → Left)"
+    else:
+        delta_in = "Line A → Line B (Top → Bottom)"
+        delta_out = "- Line B → Line A (Bottom → Top)"
 
     with kpi_col1:
         st.metric(
@@ -515,13 +659,16 @@ if "result_payload" in st.session_state:
     with st.expander("Detailed Crossing Event Audit Log", expanded=True):
         if events:
             df_events = pd.DataFrame(events)
+            rename_cols = {
+                "frame": "Frame Index",
+                "time_sec": "Timestamp (s)",
+                "id": "Track ID",
+                "type": "Direction Event",
+            }
+            if "axis" in df_events.columns:
+                rename_cols["axis"] = "Gate Axis"
             df_events.rename(
-                columns={
-                    "frame": "Frame Index",
-                    "time_sec": "Timestamp (s)",
-                    "id": "Track ID",
-                    "type": "Direction Event",
-                },
+                columns=rename_cols,
                 inplace=True,
             )
             st.dataframe(

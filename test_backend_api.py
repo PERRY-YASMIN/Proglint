@@ -108,6 +108,44 @@ class TestBackendAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertIn("not found", response.json()["detail"].lower())
 
+    def test_05_process_video_both_orientation(self):
+        """Verify /process_video accepts dual-axis 'both' orientation and coordinate parameters."""
+        temp_dir = tempfile.mkdtemp()
+        test_video_path = os.path.join(temp_dir, "test_input_both.mp4")
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(test_video_path, fourcc, 30.0, (320, 240))
+            for i in range(5):
+                frame = np.full((240, 320, 3), 80 + i, dtype=np.uint8)
+                writer.write(frame)
+            writer.release()
+
+            with open(test_video_path, "rb") as f:
+                files = {"video": ("test_input_both.mp4", f, "video/mp4")}
+                form_data = {
+                    "line_a_norm": "0.45",
+                    "line_b_norm": "0.55",
+                    "timeout_sec": "2.5",
+                    "orientation": "both",
+                    "line_a_y_norm": "0.40",
+                    "line_b_y_norm": "0.60",
+                    "line_a_x_norm": "0.35",
+                    "line_b_x_norm": "0.65",
+                }
+                response = self.client.post("/process_video", files=files, data=form_data)
+
+            self.assertEqual(response.status_code, 200)
+            res_json = response.json()
+            self.assertEqual(res_json["status"], "success")
+            self.assertEqual(res_json["performance"]["total_frames"], 5)
+
+            # Cleanup video file
+            video_file_on_disk = os.path.join(RUNS_DIR, res_json["video_filename"])
+            if os.path.exists(video_file_on_disk):
+                os.remove(video_file_on_disk)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

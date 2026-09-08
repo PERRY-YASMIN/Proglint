@@ -82,6 +82,7 @@ class EventItem(BaseModel):
     time_sec: float = Field(..., description="Video timestamp in seconds")
     id: int = Field(..., description="Tracking ID of person")
     type: str = Field(..., description="Direction type: 'IN' or 'OUT'")
+    axis: Optional[str] = Field(None, description="Tripwire axis: 'Y' or 'X' in dual-axis mode")
 
 
 class ProcessVideoResponse(BaseModel):
@@ -172,7 +173,11 @@ async def process_video(
     line_b_norm: float = Form(0.55, ge=0.0, le=1.0, description="Normalized position of Line B"),
     timeout_sec: float = Form(4.0, gt=0.0, description="Timeout in seconds for pending crossings"),
     frame_stride: int = Form(1, ge=1, le=10, description="Inference frame stride (1 = full per-frame processing)"),
-    orientation: str = Form("horizontal", description="Tripwire orientation: 'horizontal' or 'vertical'"),
+    orientation: str = Form("horizontal", description="Tripwire orientation: 'horizontal', 'vertical', or 'both'"),
+    line_a_y_norm: Optional[float] = Form(None, ge=0.0, le=1.0, description="Normalized Y position of Line A_y (horizontal gate)"),
+    line_b_y_norm: Optional[float] = Form(None, ge=0.0, le=1.0, description="Normalized Y position of Line B_y (horizontal gate)"),
+    line_a_x_norm: Optional[float] = Form(None, ge=0.0, le=1.0, description="Normalized X position of Line A_x (vertical gate)"),
+    line_b_x_norm: Optional[float] = Form(None, ge=0.0, le=1.0, description="Normalized X position of Line B_x (vertical gate)"),
 ) -> ProcessVideoResponse:
     """Process uploaded video: run tracking, dual tripwire FSM, HUD overlay, and transcode to H.264."""
     # 1. Enforce allowed video file extensions
@@ -186,7 +191,7 @@ async def process_video(
         )
 
     clean_orientation = orientation.strip().lower() if orientation else "horizontal"
-    if clean_orientation not in ("horizontal", "vertical"):
+    if clean_orientation not in ("horizontal", "vertical", "both"):
         clean_orientation = "horizontal"
 
     engine: FootfallEngine = get_engine()
@@ -222,6 +227,10 @@ async def process_video(
             timeout_sec=timeout_sec,
             frame_stride=frame_stride,
             orientation=clean_orientation,
+            line_a_y_norm=line_a_y_norm,
+            line_b_y_norm=line_b_y_norm,
+            line_a_x_norm=line_a_x_norm,
+            line_b_x_norm=line_b_x_norm,
         )
 
         # 4. Transcode raw intermediate video to universal HTML5-compatible H.264 via FFmpeg
