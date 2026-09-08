@@ -1,0 +1,5 @@
+names:
+  0: person
+path: D:\yasmin programs\PROGLINT\data\pedestrian_mini
+train: images/train
+val: images/val

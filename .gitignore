@@ -1,0 +1,31 @@
+# Virtual Environments
+cv_env/
+venv/
+env/
+.venv/
+ENV/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.cache
+
+# Execution Runs & Media Outputs
+runs/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Temporary & Log Files
+*.log
+scratch/
