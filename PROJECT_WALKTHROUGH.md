@@ -179,29 +179,33 @@ A single virtual line $y = y_{\text{gate}}$ fails in real-world scenarios due to
 - **Occlusion at the Boundary**: If a person is occluded for 2 frames right at the line, the discrete trajectory segment might jump past the line without establishing clear traversal intent.
 
 #### The Dual Virtual Tripwire "Electronic Turnstile"
-To eliminate false counts, the system implements a dual-line spatial turnstile consisting of:
-- **Line A (Outer Boundary)**: Set at normalized vertical coordinate $y_A = \text{line\_a\_norm} \times H$ (default $0.45$, rendered in Cyan).
-- **Line B (Inner Boundary)**: Set at normalized vertical coordinate $y_B = \text{line\_b\_norm} \times H$ (default $0.55$, rendered in Magenta).
-- **Hysteresis Deadband ($\Delta y$)**: A buffer zone of $\pm 10\text{ pixels}$ surrounding the gates to absorb natural step jitter.
+To eliminate false counts, the system implements a dual-line spatial turnstile supporting three distinct orientation regimes:
+1. **Horizontal (Top/Bottom Flow)**: Line $A_y$ (Outer, Cyan) and Line $B_y$ (Inner, Magenta) spanning full frame width at normalized heights $y_A$ and $y_B$. Motion along the Y-axis ($y_{\text{feet}}$) registers downward traversals ($y_A \rightarrow y_B$) as **IN** and upward traversals ($y_B \rightarrow y_A$) as **OUT**.
+2. **Vertical (Left/Right Flow)**: Line $A_x$ (Outer, Cyan) and Line $B_x$ (Inner, Magenta) spanning full frame height at normalized widths $x_A$ and $x_B$. Motion along the X-axis ($c_x = \frac{x_1 + x_2}{2}$) registers left-to-right traversals ($x_A \rightarrow x_B$) as **IN** and right-to-left traversals ($x_B \rightarrow x_A$) as **OUT**.
+3. **Simultaneous Dual-Axis ("Both" Mode - Omni-Directional Flow)**: Deploys both Horizontal and Vertical gates simultaneously with four distinct color-coded boundaries:
+   - **Horizontal Gate**: Line $A_y$ (Outer, Cyan) and Line $B_y$ (Inner, Magenta).
+   - **Vertical Gate**: Line $A_x$ (Outer, Yellow: `0, 255, 255`) and Line $B_x$ (Inner, Orange: `0, 140, 255`).
+   - Pedestrians walking diagonally or crossing either gate are independently tracked and counted.
 
 ```
                    DUAL VIRTUAL TRIPWIRE CROSSING REGIMES
 
-     EXTERIOR / OUTSIDE ZONE
-     ───────────────────────────────────────────  Line A (Outer Boundary, Cyan)
-          ▲                │
-          │ Motion: OUT    │ Motion: IN
-          │                ▼
-     INTERMEDIATE GATING TRANSIT ZONE (Hysteresis Deadband delta_y)
-          ▲                │
-          │ Motion: OUT    │ Motion: IN
-          │                ▼
-     ───────────────────────────────────────────  Line B (Inner Boundary, Magenta)
-     INTERIOR / INSIDE ZONE
+     --- HORIZONTAL GATE (Y-Axis Flow) ---       --- VERTICAL GATE (X-Axis Flow) ---
+     EXTERIOR / TOP ZONE                          EXTERIOR / LEFT ZONE
+     ════════════════════════ Line A_y (Cyan)     ║             ║
+          ▲              │                        ║  Motion: IN ║  Motion: OUT
+          │ Motion: OUT  │ Motion: IN             ║  (L -> R)   ║  (R -> L)
+          │              ▼                        ║    ══►      ║    ◄══
+     TRANSIT ZONE (Deadband delta_y)              ║             ║
+          ▲              │                        Line A_x      Line B_x
+          │ Motion: OUT  │ Motion: IN             (Yellow)      (Orange)
+          │              ▼                        ║             ║
+     ════════════════════════ Line B_y (Magenta)  INTERIOR / RIGHT ZONE
+     INTERIOR / BOTTOM ZONE
 ```
 
-#### Explicit Finite State Machine Transitions
-Each active pedestrian track ID maintains its own independent state machine:
+#### Explicit Finite State Machine Transitions & Dual-Axis Independence
+In single-axis mode (`horizontal` or `vertical`), each active track ID maintains an individual state machine. In dual-axis (`both`) mode, each track ID maintains **two independent FSM instances** (`state_y` and `state_x`):
 
 ```
                             FINITE STATE MACHINE (FSM)
@@ -212,7 +216,8 @@ Each active pedestrian track ID maintains its own independent state machine:
                                         │
                  ┌──────────────────────┴──────────────────────┐
                  │                                             │
-      Crosses Line A Downward                       Crosses Line B Upward
+      Crosses Line A Forward                        Crosses Line B Backward
+      (A_y Down or A_x Right)                       (B_y Up or B_x Left)
                  │                                             │
                  ▼                                             ▼
         ┌─────────────────┐                           ┌─────────────────┐
@@ -222,7 +227,7 @@ Each active pedestrian track ID maintains its own independent state machine:
         ┌────────┴────────┐                           ┌────────┴────────┐
         │                 │                           │                 │
  Crosses Line B     Timeout (> 4.0s)            Crosses Line A    Timeout (> 4.0s)
-    Downward         OR Retreat Back               Upward          OR Retreat Back
+    Forward          OR Retreat Back               Backward        OR Retreat Back
         │                 │                           │                 │
         ▼                 ▼                           ▼                 ▼
 ┌───────────────┐ ┌───────────────┐           ┌───────────────┐ ┌───────────────┐
@@ -239,24 +244,36 @@ Each active pedestrian track ID maintains its own independent state machine:
 
 The mathematical conditions governing state transitions are:
 
-1. **Down-to-Up vs Up-to-Down Traversal Math**:
-   In screen coordinates where $y$ increases downwards:
-   - Traversal from $y_A$ to $y_B$ ($y_A < y_B$) represents downward motion: **Direction = IN**.
-   - Traversal from $y_B$ to $y_A$ represents upward motion: **Direction = OUT**.
+1. **Forward vs. Backward Traversal Math Across Axes**:
+   - **Horizontal (Y-Axis Motion)**: Screen coordinate $y$ increases downwards ($y_A \le y_B$).
+     - Forward traversal ($y_A \rightarrow y_B$): **Direction = IN**.
+     - Backward traversal ($y_B \rightarrow y_A$): **Direction = OUT**.
+   - **Vertical (X-Axis Motion)**: Screen coordinate $x$ increases rightwards ($x_A \le x_B$).
+     - Forward traversal ($x_A \rightarrow x_B$): **Direction = IN** (Left-to-Right).
+     - Backward traversal ($x_B \rightarrow x_A$): **Direction = OUT** (Right-to-Left).
 
 2. **Discrete Frame Crossing Detection with Margin Buffer**:
-   Because video sampling is discrete, a person's foot point rarely lands exactly on $y_{\text{line}}$. The engine evaluates segment intersection between consecutive frames:
-   $$\text{Crosses Downward}(y_{\text{line}}) \iff (y_{\text{prev}} < y_{\text{line}} \le y_{\text{curr}}) \lor \left( y_{\text{curr}} > y_{\text{prev}} \land y_{\text{prev}} \le y_{\text{line}} + 5 \land y_{\text{curr}} \ge y_{\text{line}} - 5 \right)$$
-   $$\text{Crosses Upward}(y_{\text{line}}) \iff (y_{\text{prev}} > y_{\text{line}} \ge y_{\text{curr}}) \lor \left( y_{\text{curr}} < y_{\text{prev}} \land y_{\text{prev}} \ge y_{\text{line}} - 5 \land y_{\text{curr}} \le y_{\text{line}} + 5 \right)$$
+   Because video sampling is discrete, a person's foot point rarely lands exactly on the gate pixel line. The engine evaluates segment intersection between consecutive frames:
+   $$\text{Crosses Forward}(l) \iff (p_{\text{prev}} < l \le p_{\text{curr}}) \lor \left( p_{\text{curr}} > p_{\text{prev}} \land p_{\text{prev}} \le l + 5 \land p_{\text{curr}} \ge l - 5 \right)$$
+   $$\text{Crosses Backward}(l) \iff (p_{\text{prev}} > l \ge p_{\text{curr}}) \lor \left( p_{\text{curr}} < p_{\text{prev}} \land p_{\text{prev}} \ge l - 5 \land p_{\text{curr}} \le l + 5 \right)$$
 
 3. **Fast-Mover Single-Frame Jump Recovery**:
-   If a pedestrian runs or the camera drops a frame, the foot point may jump across both Line A and Line B in a single frame step ($y_{\text{prev}} < y_A$ and $y_{\text{curr}} \ge y_B$). The FSM detects this direct leap and immediately triggers `COUNTED_IN`, preventing missed events.
+   If a pedestrian runs or the camera drops a frame, the foot point may jump across both Line A and Line B in a single frame step ($p_{\text{prev}} < l_A$ and $p_{\text{curr}} \ge l_B$). The FSM detects this direct leap and immediately triggers `COUNTED_IN`, preventing missed events.
 
 4. **Permanent Double-Count Prevention Lock**:
-   Once a track reaches `COUNTED_IN` or `COUNTED_OUT`, it records exactly one crossing event and immediately transitions to `COMPLETED`. While in `COMPLETED`, the FSM rejects all further transitions for that track ID. Even if the person stops, turns around, or wanders around the doorway, they cannot trigger a second count under that ID.
+   Once a track reaches `COUNTED_IN` or `COUNTED_OUT` on an axis, it records exactly one crossing event and immediately transitions to `COMPLETED`. While in `COMPLETED`, the FSM rejects all further transitions for that track ID on that axis. Even if the person stops, turns around, or wanders around the doorway, they cannot trigger a second count under that ID.
 
-5. **Temporal Timeout & Stale Track Garbage Collection**:
-   If a track enters `PENDING_IN` (crossed Line A) but fails to cross Line B within $T_{\text{timeout}} = 4.0\text{ seconds}$ (or steps backward beyond $y_A - \Delta y$), the pending state resets to `IDLE`. Furthermore, when a track leaves the camera frame and is unseen for more than $\tau_{\text{purge}} = 60\text{ frames}$, its memory footprint is purged from the active dictionary, preventing memory leaks during 24/7 continuous operation.
+5. **Dual-Axis State Reconciliation for HUD Rendering**:
+   In `"both"` mode, `state_y` and `state_x` evolve independently. To render a single intuitive bounding box color badge on the HUD, the engine computes a composite state $\text{state}_{\text{comp}}$ using strict precedence:
+   $$\text{state}_{\text{comp}} = \begin{cases} 
+   \text{COUNTED\_IN / OUT} & \text{if } \text{COUNTED} \in \{\text{state}_y, \text{state}_x\} \\
+   \text{COMPLETED} & \text{elif } \text{COMPLETED} \in \{\text{state}_y, \text{state}_x\} \\
+   \text{PENDING\_IN / OUT} & \text{elif } \text{PENDING} \in \{\text{state}_y, \text{state}_x\} \\
+   \text{IDLE} & \text{otherwise}
+   \end{cases}$$
+
+6. **Temporal Timeout & Stale Track Garbage Collection**:
+   If a track enters `PENDING_IN` (crossed Line A) but fails to cross Line B within $T_{\text{timeout}} = 4.0\text{ seconds}$ (or steps backward beyond $l_A - \Delta$), the pending state resets to `IDLE`. Furthermore, when a track leaves the camera frame and is unseen for more than $\tau_{\text{purge}} = 60\text{ frames}$, its memory footprint is purged from the active dictionary, preventing memory leaks during 24/7 continuous operation.
 
 ---
 
@@ -346,8 +363,8 @@ def get_default_model_path() -> str:
 ```
 When instantiated without parameters, `FootfallEngine` automatically checks for `runs/custom_train/best.pt`. If found, it seamlessly upgrades inference to the custom fine-tuned weights without requiring code changes or configuration flags.
 
-#### Data Structures for Trajectory Management
-Each tracked pedestrian is encapsulated in a dedicated `TrackInfo` dataclass:
+#### Data Structures for Trajectory & Dual-Axis Management
+Each tracked pedestrian is encapsulated in a dedicated `TrackInfo` dataclass supporting both single-axis and simultaneous dual-axis FSM states:
 ```python
 @dataclass
 class TrackInfo:
@@ -355,6 +372,13 @@ class TrackInfo:
     state: TrackState = TrackState.IDLE
     state_start_time: float = 0.0
     state_start_frame: int = 0
+    # Independent FSM states for dual-axis ("both") mode
+    state_y: TrackState = TrackState.IDLE
+    state_y_start_time: float = 0.0
+    state_y_start_frame: int = 0
+    state_x: TrackState = TrackState.IDLE
+    state_x_start_time: float = 0.0
+    state_x_start_frame: int = 0
     last_seen_frame: int = 0
     prev_feet_point: Optional[Tuple[float, float]] = None
     last_feet_point: Optional[Tuple[float, float]] = None
@@ -365,8 +389,51 @@ class TrackInfo:
 ```
 The bounded double-ended queue (`deque(maxlen=30)`) stores the last 30 feet coordinates for trajectory visualization while strictly bounding memory consumption.
 
+#### Dynamic FSM Axis Routing & Composite State Synchronization
+In `FootfallEngine._update_fsm`, state transitions are routed dynamically to `state_y`, `state_x`, or legacy `state`:
+```python
+# Determine active axis state
+if axis == "y":
+    current_state = track.state_y
+    start_time = track.state_y_start_time
+elif axis == "x":
+    current_state = track.state_x
+    start_time = track.state_x_start_time
+else:
+    current_state = track.state
+    start_time = track.state_start_time
+
+# Composite synchronization for overlay bounding box coloring
+def _sync_composite_state() -> None:
+    if axis is None:
+        return
+    states = (track.state_y, track.state_x)
+    if TrackState.COUNTED_IN in states:
+        track.state = TrackState.COUNTED_IN
+    elif TrackState.COUNTED_OUT in states:
+        track.state = TrackState.COUNTED_OUT
+    elif TrackState.COMPLETED in states:
+        track.state = TrackState.COMPLETED
+    elif TrackState.PENDING_IN in states:
+        track.state = TrackState.PENDING_IN
+    elif TrackState.PENDING_OUT in states:
+        track.state = TrackState.PENDING_OUT
+    else:
+        track.state = TrackState.IDLE
+```
+When an entry or exit is registered, the audit payload records `"axis": "Y"` or `"axis": "X"` while preserving backward-compatible schemas for single-axis runs.
+
+#### Multi-Color Overlay Rendering (`_draw_overlays`)
+Tripwires are rendered across the frame using dedicated high-contrast BGR tuples:
+- **Horizontal Gate (Cyan / Magenta)**:
+  - Line $A_y$ (Outer): `COLOR_CYAN = (255, 255, 0)`
+  - Line $B_y$ (Inner): `COLOR_MAGENTA = (255, 0, 255)`
+- **Vertical Gate (Yellow / Orange in Both Mode)**:
+  - Line $A_x$ (Outer): `COLOR_YELLOW = (0, 255, 255)`
+  - Line $B_x$ (Inner): `COLOR_ORANGE = (0, 140, 255)`
+
 #### Strict OpenCV Coordinate Casting Safeguards
-OpenCV rendering functions (`cv2.circle`, `cv2.rectangle`, `cv2.putText`) are implemented in C++ and strictly reject floating-point numbers or `NaN` values, throwing unrecoverable runtime errors if passed non-integers. `FootfallEngine._draw_overlays` implements strict casting and boundary clamping:
+OpenCV rendering functions (`cv2.circle`, `cv2.rectangle`, `cv2.putText`, `cv2.line`) are implemented in C++ and strictly reject floating-point numbers or `NaN` values, throwing unrecoverable runtime errors if passed non-integers. `FootfallEngine._draw_overlays` implements strict casting and boundary clamping:
 ```python
 # Bounding box coordinate protection:
 raw_x1, raw_y1, raw_x2, raw_y2 = track.bbox
@@ -478,7 +545,7 @@ app = FastAPI(
 ```
 
 #### Video Processing Endpoint (`/process_video`)
-The endpoint handles multipart form uploads, writes video chunks directly to disk without loading entire files into memory, and offloads blocking inference to the thread pool:
+The endpoint handles multipart form uploads, writes video chunks directly to disk without loading entire files into memory, accepts multi-orientation parameters, and offloads blocking inference to the thread pool:
 ```python
 @app.post("/process_video", response_model=ProcessVideoResponse)
 async def process_video(
@@ -487,6 +554,11 @@ async def process_video(
     line_b_norm: float = Form(0.55, ge=0.0, le=1.0),
     timeout_sec: float = Form(4.0, gt=0.0),
     frame_stride: int = Form(1, ge=1, le=10),
+    orientation: str = Form("horizontal"),  # "horizontal" | "vertical" | "both"
+    line_a_y_norm: Optional[float] = Form(None, ge=0.0, le=1.0),
+    line_b_y_norm: Optional[float] = Form(None, ge=0.0, le=1.0),
+    line_a_x_norm: Optional[float] = Form(None, ge=0.0, le=1.0),
+    line_b_x_norm: Optional[float] = Form(None, ge=0.0, le=1.0),
 ) -> ProcessVideoResponse:
     # 1. Stream video to disk in 1MB chunks to prevent memory bloat
     with open(temp_input_path, "wb") as buffer:
@@ -502,6 +574,11 @@ async def process_video(
         line_b_norm=line_b_norm,
         timeout_sec=timeout_sec,
         frame_stride=frame_stride,
+        orientation=clean_orientation,
+        line_a_y_norm=line_a_y_norm,
+        line_b_y_norm=line_b_y_norm,
+        line_a_x_norm=line_a_x_norm,
+        line_b_x_norm=line_b_x_norm,
     )
 
     # 3. Transcode to web-compatible H.264 via FFmpeg subprocess
@@ -522,7 +599,7 @@ async def process_video(
 ```
 
 #### Structured Pydantic Response Contract
-The API response guarantees strict typing:
+The API response guarantees strict typing with optional axis telemetry:
 ```json
 {
   "status": "success",
@@ -542,7 +619,15 @@ The API response guarantees strict typing:
       "frame": 38,
       "time_sec": 1.267,
       "id": 4,
-      "type": "IN"
+      "type": "IN",
+      "axis": "Y"
+    },
+    {
+      "frame": 52,
+      "time_sec": 1.733,
+      "id": 4,
+      "type": "IN",
+      "axis": "X"
     }
   ]
 }
@@ -551,23 +636,37 @@ The API response guarantees strict typing:
 ---
 
 ### 4.4 `frontend/app.py`: Real-Time Analytical Streamlit Dashboard
-The frontend provides an intuitive web interface for operators to calibrate virtual tripwires and inspect footfall telemetry.
+The frontend provides an intuitive web interface for operators to calibrate virtual tripwires across all orientations and inspect footfall telemetry.
 
-#### First-Frame Live Calibration Preview
-Before initiating lengthy video processing, the operator adjusts normalized tripwire sliders (`line_a_norm` and `line_b_norm`). The frontend extracts the very first frame of the uploaded video in memory, overlays the tripwires, and renders a live preview:
+#### Omni-Directional Calibration & Live Preview
+The operator chooses between three flow regimes:
+`["Horizontal (Top/Bottom Flow)", "Vertical (Left/Right Flow)", "Both (Dual-Axis Flow)"]`.
+When **Both** is selected, independent sliders configure Horizontal ($Line\ A_y, Line\ B_y$) and Vertical ($Line\ A_x, Line\ B_x$) gates:
 ```python
-def draw_calibration_lines(frame: np.ndarray, line_a_norm: float, line_b_norm: float) -> np.ndarray:
+def draw_calibration_lines(
+    frame: np.ndarray,
+    line_a_norm: float = 0.45,
+    line_b_norm: float = 0.55,
+    orientation: str = "horizontal",
+    *,
+    line_a_y_norm: Optional[float] = None,
+    line_b_y_norm: Optional[float] = None,
+    line_a_x_norm: Optional[float] = None,
+    line_b_x_norm: Optional[float] = None,
+) -> np.ndarray:
     annotated = frame.copy()
     h, w = annotated.shape[:2]
-    y_a = int(line_a_norm * h)
-    y_b = int(line_b_norm * h)
 
-    # Line A (Outer: Cyan) & Line B (Inner: Magenta)
-    cv2.line(annotated, (0, y_a), (w, y_a), (255, 255, 0), 2, cv2.LINE_AA)
-    cv2.line(annotated, (0, y_b), (w, y_b), (255, 0, 255), 2, cv2.LINE_AA)
-    return cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+    if orientation == "both":
+        # Horizontal Gate: Cyan & Magenta
+        cv2.line(annotated, (0, y_a), (w, y_a), (255, 255, 0), 2, cv2.LINE_AA)
+        cv2.line(annotated, (0, y_b), (w, y_b), (255, 0, 255), 2, cv2.LINE_AA)
+        # Vertical Gate: Yellow & Orange
+        cv2.line(annotated, (x_a, 0), (x_a, h), (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.line(annotated, (x_b, 0), (x_b, h), (0, 140, 255), 2, cv2.LINE_AA)
+    ...
 ```
-This enables zero-latency spatial calibration without processing a single frame of deep learning inference.
+This enables zero-latency spatial calibration without running deep learning inference.
 
 #### Step-Wise Occupancy Timeline Chart
 The net occupancy over time is rendered using Plotly step charts (`line_shape="hv"`), reflecting the discrete nature of human crossings:
@@ -587,12 +686,12 @@ fig.add_trace(
 
 #### Operational Metric Cards & Audit Table
 The dashboard displays 4 primary operational KPIs:
-1. **Total Entries (IN)**: Incremented on Line A $\rightarrow$ Line B traversals.
+1. **Total Entries (IN)**: Incremented on Line A $\rightarrow$ Line B traversals (labeled with active orientation context).
 2. **Total Exits (OUT)**: Incremented on Line B $\rightarrow$ Line A traversals.
 3. **Current Occupancy (Net)**: Dynamically computed as $\text{Occupancy} = \text{Total}_{\text{IN}} - \text{Total}_{\text{OUT}}$.
 4. **Processing Throughput**: Real-time FPS and total frames processed.
 
-Below the metrics, a complete chronological audit table lists every individual crossing with its exact video timestamp, frame index, track ID, and directional event.
+Below the metrics, a complete chronological audit table lists every individual crossing with its exact video timestamp, frame index, track ID, directional event, and **Gate Axis** (`Y` or `X`).
 
 ---
 
@@ -692,6 +791,31 @@ Under this configuration, the system registered **zero footfall counts**, even w
 
 ---
 
+### 5.5 Horizontal Flow & Omni-Directional Crossing Bottleneck
+- **The Issue**: Fixed horizontal tripwires operate strictly on vertical displacement ($y_{\text{feet}}$ relative to $y_a$ and $y_b$). In architectural layouts where pedestrians move horizontally (e.g., crosswalks, east-west concourses, sideways supermarket aisles), pedestrians walk entirely along the X-axis:
+$$\Delta y \approx 0, \quad \Delta x \gg 0$$
+Because their feet coordinates never cross the horizontal thresholds, the system recorded **zero counts**, remaining completely blind to high-volume transverse traffic. Conversely, switching solely to vertical tripwires blinded the system to traditional top-to-bottom flow. In complex transit intersections, pedestrian traffic is inherently **omni-directional**, entering and exiting from multiple orthogonal directions simultaneously.
+- **The Solution**: An extensible multi-regime tripwire architecture was engineered across the entire pipeline:
+  1. **Three Configurable Gate Regimes**:
+     - `horizontal`: Standard top/bottom flow monitored via $y_{\text{feet}}$ against $y_a, y_b$.
+     - `vertical`: Left/right flow monitored via foot horizontal center $c_x = \text{round}((x_1+x_2)/2)$ against normalized vertical gates $x_a, x_b$.
+     - `both`: Simultaneous dual-axis monitoring enabling omni-directional counting across intersecting pedestrian paths.
+  2. **Orthogonal Motion Decoupling & Independent FSM States**:
+     In `"both"` mode, rather than forcing a single FSM state to represent a two-dimensional trajectory (which would suffer from state collision if a person turns a corner), `TrackInfo` maintains two decoupled state machines:
+     $$\mathbf{S}_{\text{track}} = \langle \text{state\_y}, \text{state\_x} \rangle$$
+     - $\text{state\_y}$ tracks vertical traversal ($y_{\text{prev}} \to y_{\text{curr}}$ across $y_a$ and $y_b$).
+     - $\text{state\_x}$ tracks horizontal traversal ($x_{\text{prev}} \to x_{\text{curr}}$ across $x_a$ and $x_b$).
+     Each state machine transitions independently with its own timestamp and crossing logic.
+  3. **Composite State Synchronization & Visual Disambiguation**:
+     For bounding box HUD rendering, an unequivocal priority hierarchy (`COUNTED` > `COMPLETED` > `PENDING` > `IDLE`) unifies the two states into a single visual status.
+     Four distinct BGR color tuples visually isolate the gates on the calibration HUD and output video:
+     - Horizontal Gate: Cyan ($A_y$) and Magenta ($B_y$)
+     - Vertical Gate: Yellow ($A_x$) and Orange ($B_x$)
+  4. **Axis-Tagged Telemetry**:
+     Each crossing event records its triggering axis (`"axis": "Y"` or `"axis": "X"`), feeding cumulative totals and populating a dedicated **Gate Axis** column in the analytical audit trail without breaking legacy single-axis schemas.
+
+---
+
 ## 6. Verification, Metrics & How to Interpret Dashboard Results
 
 ### 6.1 Understanding the Analytical UI
@@ -699,38 +823,46 @@ Under this configuration, the system registered **zero footfall counts**, even w
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │ 🚶 Footfall Analytics Hub                                                                   │
-│ Production Computer Vision Pipeline powered by YOLO11, ByteTrack, and Dual Virtual Tripwires│
+│ Production Computer Vision Pipeline powered by YOLO11, ByteTrack, and Multi-Axis Tripwires  │
 ├───────────────────┬───────────────────┬─────────────────────────┬───────────────────────────┤
 │ TOTAL ENTRIES(IN) │ TOTAL EXITS (OUT) │ CURRENT OCCUPANCY (NET) │ PROCESSING THROUGHPUT     │
 │       14          │        9          │           5             │        48.2 FPS           │
 │ Line A -> Line B  │ Line B -> Line A  │ Unique Tracks: 23       │ 450 Frames (RTX 4060)     │
 ├───────────────────┴───────────────────┴─────────────────────────┴───────────────────────────┤
+│ ⚙️ SIDEBAR CONFIGURATION (Mode: Both / Dual-Axis Flow)                                       │
+│ • Gate Orientation: [ ] Horizontal  [ ] Vertical  [x] Both (Dual-Axis Flow)                 │
+│ • Horizontal Gate: Line A_y (Cyan) = 0.45  |  Line B_y (Magenta) = 0.55                    │
+│ • Vertical Gate:   Line A_x (Yellow) = 0.35 | Line B_x (Orange) = 0.65                      │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
 │ 🎬 ANNOTATED VIDEO PLAYBACK & FLOW ANALYSIS                                                 │
 │ ┌───────────────────────────────────────┐ ┌───────────────────────────────────────────────┐ │
 │ │  [HTML5 H.264 Video Stream]           │ │ Real-Time Occupancy Flow Over Timeline        │ │
-│ │  • Cyan Line: Line A (Outer)          │ │   8 ┤       /\                                │ │
-│ │  • Magenta Line: Line B (Inner)       │ │   6 ┤  ┌───┘  \                               │ │
-│ │  • Green Boxes: Counted Pedestrians   │ │   4 ┤──┘       └──┐                           │ │
-│ │  • Amber Boxes: In Transit (Pending)  │ │   2 ┤             └───                        │ │
-│ │  • Yellow Dots: Ground Feet Contact   │ │   0 ┴────────────────────────► Time (s)       │ │
+│ │  • Cyan: Line A_y (Outer Top)         │ │   8 ┤       /\                                │ │
+│ │  • Magenta: Line B_y (Inner Bottom)   │ │   6 ┤  ┌───┘  \                               │ │
+│ │  • Yellow: Line A_x (Outer Left)      │ │   4 ┤──┘       └──┐                           │ │
+│ │  • Orange: Line B_x (Inner Right)     │ │   2 ┤             └───                        │ │
+│ │  • Green Boxes: Counted Pedestrians   │ │   0 ┴────────────────────────► Time (s)       │ │
+│ │  • Amber Boxes: In Transit (Pending)  │ │                                               │ │
+│ │  • Yellow Dots: Ground Feet Contact   │ │                                               │ │
 │ └───────────────────────────────────────┘ └───────────────────────────────────────────────┘ │
 ├─────────────────────────────────────────────────────────────────────────────────────────────┤
 │ 📋 DETAILED CROSSING EVENT AUDIT LOG                                                        │
-│ Frame Index │ Timestamp (s) │ Track ID │ Direction Event                                    │
-│ 38          │ 1.27          │ 4        │ IN                                                 │
-│ 72          │ 2.40          │ 2        │ IN                                                 │
-│ 115         │ 3.83          │ 7        │ OUT                                                │
-│ 142         │ 4.73          │ 9        │ IN                                                 │
+│ Frame Index │ Timestamp (s) │ Track ID │ Direction Event │ Gate Axis                        │
+│ 38          │ 1.27          │ 4        │ IN              │ Y                                │
+│ 52          │ 1.73          │ 4        │ IN              │ X                                │
+│ 72          │ 2.40          │ 2        │ IN              │ Y                                │
+│ 115         │ 3.83          │ 7        │ OUT             │ X                                │
+│ 142         │ 4.73          │ 9        │ IN              │ Y                                │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-1. **Total Entries (IN)**: The cumulative count of physical persons who completed the full traversal sequence: Exterior $\rightarrow$ Crossed Line A $\rightarrow$ Traversed Gate Zone $\rightarrow$ Crossed Line B $\rightarrow$ Interior.
+1. **Total Entries (IN)**: The cumulative count of physical persons who completed the full traversal sequence: Exterior $\rightarrow$ Crossed Line A $\rightarrow$ Traversed Gate Zone $\rightarrow$ Crossed Line B $\rightarrow$ Interior (summed across active axes).
 2. **Total Exits (OUT)**: The cumulative count of persons who completed the reverse traversal: Interior $\rightarrow$ Crossed Line B $\rightarrow$ Traversed Gate Zone $\rightarrow$ Crossed Line A $\rightarrow$ Exterior.
 3. **Current Occupancy (Net)**: Represents the live count of individuals currently residing inside the monitored facility:
 $$\text{Occupancy}(t) = \text{Total}_{\text{IN}}(t) - \text{Total}_{\text{OUT}}(t)$$
 4. **Processing Throughput**: Displays the sustained frames-per-second achieved by the inference and tracking engine. Values $> 24\text{ FPS}$ indicate real-time capability; values $> 45\text{ FPS}$ indicate surplus capacity for multi-camera multiplexing.
 5. **Occupancy Step Chart**: A Plotly visualization showing the minute-by-minute ebb and flow of occupancy. Vertical steps indicate entry/exit events, while flat horizontal plateaus indicate stable occupancy periods.
-6. **Crossing Audit Trail**: A tamper-evident chronological event log suitable for export to enterprise database management systems (SQL, BigQuery, Snowflake) for retail conversion rate analysis, staff scheduling, or emergency evacuation headcounts.
+6. **Crossing Audit Trail**: A tamper-evident chronological event log with **Gate Axis** telemetry suitable for export to enterprise database management systems (SQL, BigQuery, Snowflake) for retail conversion rate analysis, staff scheduling, or emergency evacuation headcounts.
 
 ---
 
@@ -762,10 +894,10 @@ python run.py both
 #### Step 3: Run the Automated Test Suite
 To verify all unit, integration, API, and end-to-end contracts:
 ```powershell
-# Run FSM and core tracking engine tests
+# Run FSM and core tracking engine tests (25 tests covering single/dual-axis FSM, overlays, and video)
 python -m unittest test_footfall_engine.py
 
-# Run FastAPI backend service tests
+# Run FastAPI backend service tests (6 API tests validating horizontal, vertical, and both orientations)
 python -m unittest test_backend_api.py
 
 # Run complete end-to-end integration test
@@ -781,9 +913,9 @@ python -m unittest test_e2e.py
 | **Detection** | Ultralytics YOLO11n | Single-shot pedestrian localization | Anchor-free head, class 0 filtering, FP16 AMP |
 | **Tracking** | ByteTrack | Multi-object temporal data association | Low-confidence recovery without deep Re-ID embeddings |
 | **Geometry** | Ground Feet Contact | Spatial anchor calculation | $(\frac{x_1+x_2}{2}, y_2)$ eliminates 3D perspective parallax |
-| **Gating** | Dual Tripwire FSM | Bidirectional counting & double-count lock | Margin buffers, hysteresis deadband, 4.0s timeout |
-| **API Gateway**| FastAPI + Uvicorn | Asynchronous REST endpoints | Streaming upload chunks, async threadpool execution |
+| **Gating** | Multi-Axis Tripwire FSM | Bidirectional counting & double-count lock | Horizontal, Vertical & Dual-Axis gating; independent state_y/state_x, 4.0s timeout |
+| **API Gateway**| FastAPI + Uvicorn | Asynchronous REST endpoints | Streaming upload chunks, async threadpool execution, multi-orientation validation |
 | **Video Stream**| Subprocess FFmpeg | HTML5 video compatibility | `libx264`, `yuv420p`, `-preset ultrafast` |
-| **Dashboard** | Streamlit + Plotly | Interactive operator interface | First-frame preview, step-chart occupancy timeline |
+| **Dashboard** | Streamlit + Plotly | Interactive operator interface | First-frame preview, dual-axis sliders, step-chart occupancy timeline, axis audit trail |
 
 This architecture achieves real-time edge processing speeds ($> 45\text{ FPS}$ on an NVIDIA RTX 4060), eliminates duplicate counting under loitering and pacing conditions, and delivers a robust, web-compatible video analytics solution.
