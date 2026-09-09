@@ -1,14 +1,4 @@
-"""ProGlint Footfall Analytics Engine package initialization."""
+"""engine/__init__.py - Unified Footfall Engine Exports."""
+from engine.tracker import FootfallEngine, DEFAULT_MODEL, CUSTOM_WEIGHTS_PATH, get_default_model_path
 
-from engine.fsm_counter import DualTripwireFSM, TrackInfo, TrackState
-from engine.detector import RTDETRDetector, get_detector
-from engine.tracker import FootfallEngine
-
-__all__ = [
-    "FootfallEngine",
-    "TrackInfo",
-    "TrackState",
-    "DualTripwireFSM",
-    "RTDETRDetector",
-    "get_detector",
-]
+__all__ = ["FootfallEngine", "DEFAULT_MODEL", "CUSTOM_WEIGHTS_PATH", "get_default_model_path"]
